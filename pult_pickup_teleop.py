@@ -14,13 +14,18 @@ pult_pickup_teleop.py
                               донастройки (JOGGING)
     правый стик (лево/право, верх/низ) -> в режиме JOGGING двигает захват
                               по X/Y (мм за тик, с зоной нечувствительности)
-    VRA (крутилка)         -> в режиме JOGGING двигает захват по Z (высота)
-    SWA -> down (из JOGGING): выполнить спуск-захват-подъём из ТЕКУЩЕЙ
-                              (уже подогнанной) позы -> состояние HOLDING
+    VRA (крутилка)         -> в режиме JOGGING двигает захват по Z (высота) --
+                              это и есть "спуск к предмету": подводи вплотную
+                              джойстиком/VRA, отдельного автоспуска перед
+                              хватом больше нет (см. grasp_and_lift() ниже)
+    SWA -> down (из JOGGING): закрыть захват ПРЯМО ИЗ ТЕКУЩЕЙ (уже подогнанной
+                              джойстиком/VRA) позы и подняться -> HOLDING
     SWA -> down (из HOLDING): отпустить предмет, вернуть руку в home ->
                               состояние IDLE
-    SWD -> down (из JOGGING): сбросить донастройку, вернуться к базовой
-                              approach-позе (переснять офсет в ноль)
+    SWD -> down (из JOGGING): реально вернуть руку в базовую approach-позу
+                              (move_joints(APPROACH)) и заново включить
+                              донастройку с нуля (было -- просто "забывало"
+                              текущий сдвиг, руку никуда не двигая)
 
 State machine:
     IDLE --SWD--> JOGGING --SWA--> HOLDING --SWA--> IDLE
@@ -87,29 +92,45 @@ class PickupTeleop:
 
     # -- переходы состояний --------------------------------------------------
 
+    def _enter_jogging(self, reason: str) -> None:
+        """
+        Выходит в approach-позу и включает ручную донастройку. Общий код для
+        IDLE->JOGGING и для сброса донастройки (повторный SWD внутри JOGGING) --
+        раньше сброс НИКУДА физически не двигал руку (просто заново запоминал
+        текущую, уже сдвинутую позицию как "ноль"), из-за чего повторный SWD
+        выглядел так, будто рука вообще не реагирует. Теперь оба случая явно
+        командуют move_joints(APPROACH, wait_settle=True) -- ждут подтверждения
+        по фидбеку, что рука ДЕЙСТВИТЕЛЬНО пришла в позу, и только потом
+        фиксируют её как базу для джога. wait_settle заодно чинит и другую
+        проблему -- раньше поза "на старте джога" бралась ровно через
+        фиксированную time.sleep(1.0), и если движение не успевало закончиться
+        (например, после долгого перегона от home) -- джог стартовал из
+        случайной промежуточной точки, поэтому конечная поза "гуляла" от
+        запуска к запуску.
+        """
+        logger.info("%s: выхожу в approach, включаю ручную донастройку", reason)
+        self.arm.move_joints(APPROACH, wait_settle=True)
+        self.arm.begin_jog()
+        self.state = State.JOGGING
+
     def _on_swd_down(self, s: RcState) -> None:
         if self.state == State.IDLE:
             if self.live and not self.rc.is_stationary():
                 logger.warning("SWD игнорирован: база ещё движется (v=%.3f м/с, w=%.3f рад/с)",
                                 self.rc.linear_mps or 0.0, self.rc.angular_radps or 0.0)
                 return
-            logger.info(">>> IDLE -> JOGGING: выхожу в approach, включаю ручную донастройку")
-            self.arm.move_joints(APPROACH)
-            time.sleep(1.0)
-            self.arm.begin_jog()
-            self.state = State.JOGGING
+            self._enter_jogging(">>> IDLE -> JOGGING")
 
         elif self.state == State.JOGGING:
-            logger.info(">>> сброс донастройки к базовой approach-позе")
-            self.arm.begin_jog()
+            self._enter_jogging(">>> сброс донастройки: возврат в approach-позу")
 
         else:
             logger.info("SWD в состоянии %s игнорируется", self.state)
 
     def _on_swa_down(self, s: RcState) -> None:
         if self.state == State.JOGGING:
-            logger.info(">>> JOGGING -> HOLDING: спуск-захват-подъём из текущей позы")
-            self.arm.descend_grasp_lift()
+            logger.info(">>> JOGGING -> HOLDING: хват из текущей (уже подогнанной джойстиком) позы")
+            self.arm.grasp_and_lift()
             self.state = State.HOLDING
 
         elif self.state == State.HOLDING:

@@ -190,6 +190,15 @@ class PiperArmController:
     CONFIRM_TIMEOUT_S = 1.5   # сколько ждём подтверждения после каждой попытки
     CONFIRM_POLL_S = 0.05
 
+    # ожидание физического прихода в целевую joint-позу (move_joints(..., wait_settle=True))
+    MOVE_SETTLE_TIMEOUT_S = 5.0
+    MOVE_SETTLE_POLL_S = 0.1
+    MOVE_SETTLE_TOL_DEG = 1.5
+
+    # как часто во время джога перепроверяем реальный режим руки по фидбеку
+    # (а не просто доверяем закэшированному self._move_mode) -- см. apply_jog()
+    JOG_MODE_RECHECK_S = 0.5
+
     def __init__(self, can_name: str = "can_piper", dry_run: bool = True):
         self.can_name = can_name
         self.dry_run = dry_run
@@ -198,6 +207,7 @@ class PiperArmController:
         self._move_mode: Optional[str] = None   # "joint" | "end_pose" | None
         self._jog_base: Optional[EndPose] = None
         self._jog_offset = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self._last_mode_check = 0.0
 
         if not dry_run:
             from piper_sdk import C_PiperInterface_V2
@@ -382,7 +392,16 @@ class PiperArmController:
             clipped[name] = max(lo, min(hi, v))
         return JointAngles(**clipped)
 
-    def move_joints(self, joints: JointAngles) -> None:
+    def move_joints(self, joints: JointAngles, wait_settle: bool = False) -> None:
+        """
+        wait_settle=True: не возвращаться, пока рука реально не придёт в целевую
+        позу (по фидбеку GetArmJointMsgs(), с допуском MOVE_SETTLE_TOL_DEG и
+        таймаутом MOVE_SETTLE_TIMEOUT_S) -- вместо того чтобы гадать фиксированной
+        задержкой time.sleep(...). Это важно перед тем, как что-то ещё читает
+        текущую позу руки (например begin_jog() в pult_pickup_teleop.py) --
+        иначе можно случайно снять позу "на лету", в середине движения, и
+        каждый раз получать чуть разную точку (см. README, диагностика).
+        """
         if not self._enabled:
             raise RuntimeError("PiPER не включён: вызови enable() перед движением")
         self.enable_joint_mode()
@@ -393,14 +412,34 @@ class PiperArmController:
         if self.dry_run:
             logger.info("[PiPER] (dry_run) JointCtrl(%s)", (j1, j2, j3, j4, j5, j6))
             return
+
         try:
             self._piper.JointCtrl(j1, j2, j3, j4, j5, j6)
         except Exception:
-            logger.exception("[PiPER] JointCtrl(%s) не удался -- команда НЕ ушла в CAN", (j1, j2, j3, j4, j5, j6))
-            raise
+            logger.exception("[PiPER] JointCtrl(%s) попытка 1/2 не удалась -- повторяю",
+                              (j1, j2, j3, j4, j5, j6))
+            try:
+                self._piper.JointCtrl(j1, j2, j3, j4, j5, j6)
+            except Exception:
+                logger.exception("[PiPER] JointCtrl(%s) не удался -- команда НЕ ушла в CAN",
+                                  (j1, j2, j3, j4, j5, j6))
+                raise
+
+        if wait_settle:
+            deadline = time.time() + self.MOVE_SETTLE_TIMEOUT_S
+            while time.time() < deadline:
+                if self._joints_close(joints):
+                    return
+                time.sleep(self.MOVE_SETTLE_POLL_S)
+            logger.warning(
+                "[PiPER] move_joints: рука не подтвердила приход в целевую позу за %.1fс "
+                "(GetArmJointMsgs() так и не сошёлся в пределах %.1f°) -- продолжаю всё равно, "
+                "но следующая captured поза может быть не окончательной",
+                self.MOVE_SETTLE_TIMEOUT_S, self.MOVE_SETTLE_TOL_DEG,
+            )
 
     def move_home(self) -> None:
-        self.move_joints(JointAngles(0, 0, 0, 0, 0, 0))
+        self.move_joints(JointAngles(0, 0, 0, 0, 0, 0), wait_settle=True)
 
     # -- декартовы движения (MOVE L) для ручной донастройки -----------------
 
@@ -413,6 +452,29 @@ class PiperArmController:
         return EndPose(
             x=ep.X_axis / 1000.0, y=ep.Y_axis / 1000.0, z=ep.Z_axis / 1000.0,
             rx=ep.RX_axis / 1000.0, ry=ep.RY_axis / 1000.0, rz=ep.RZ_axis / 1000.0,
+        )
+
+    def get_joint_angles_deg(self) -> Optional[JointAngles]:
+        """Читает текущие углы суставов по фидбеку. В dry_run -- None."""
+        if self.dry_run:
+            return None
+        msg = self._piper.GetArmJointMsgs()
+        j = msg.joint_state
+        return JointAngles(
+            j1=j.joint_1 / 1000.0, j2=j.joint_2 / 1000.0, j3=j.joint_3 / 1000.0,
+            j4=j.joint_4 / 1000.0, j5=j.joint_5 / 1000.0, j6=j.joint_6 / 1000.0,
+        )
+
+    def _joints_close(self, target: JointAngles, tol_deg: float = None) -> bool:
+        """True, если текущие углы суставов совпадают с target в пределах tol_deg."""
+        if tol_deg is None:
+            tol_deg = self.MOVE_SETTLE_TOL_DEG
+        cur = self.get_joint_angles_deg()
+        if cur is None:  # dry_run -- нечего ждать
+            return True
+        return all(
+            abs(getattr(cur, name) - getattr(target, name)) <= tol_deg
+            for name in ("j1", "j2", "j3", "j4", "j5", "j6")
         )
 
     def move_to_pose(self, pose: EndPose) -> None:
@@ -428,8 +490,12 @@ class PiperArmController:
         try:
             self._piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
         except Exception:
-            logger.exception("[PiPER] EndPoseCtrl(...) не удался -- команда НЕ ушла в CAN")
-            raise
+            logger.exception("[PiPER] EndPoseCtrl(...) попытка 1/2 не удалась -- повторяю")
+            try:
+                self._piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+            except Exception:
+                logger.exception("[PiPER] EndPoseCtrl(...) не удался -- команда НЕ ушла в CAN")
+                raise
 
     def begin_jog(self, base_pose: Optional[EndPose] = None) -> EndPose:
         """
@@ -474,8 +540,63 @@ class PiperArmController:
             z=self._jog_base.z + self._jog_offset["z"],
             rx=self._jog_base.rx, ry=self._jog_base.ry, rz=self._jog_base.rz,
         )
+
+        # Периодически (не на каждый тик, чтобы не тормозить джог) сверяем
+        # РЕАЛЬНЫЙ режим руки по фидбеку, а не просто доверяем закэшированному
+        # self._move_mode. Если режим где-то незаметно "уехал" (например, был
+        # кратковременный сбой связи и рука откатилась в standby) -- обычный
+        # move_to_pose() этого не заметит и будет молча слать EndPoseCtrl в
+        # пустоту, а джойстик/VRA визуально перестанут действовать. Это
+        # наиболее вероятная причина периодической "неотзывчивости" джога.
+        if not self.dry_run:
+            now = time.time()
+            if now - self._last_mode_check >= self.JOG_MODE_RECHECK_S:
+                self._last_mode_check = now
+                if not self._ctrl_mode_feedback_is(0x01, 0x02):
+                    logger.warning("[PiPER] джог: реальный режим руки разошёлся с ожидаемым MOVE L "
+                                    "-- переотправляю ModeCtrl и повторяю попытку")
+                    self._move_mode = None
+                    self.enable_end_pose_mode()
+
         self.move_to_pose(target)
         return target
+
+    def grasp_and_lift(self, lift_mm: float = 80.0,
+                        gripper_close_mm: float = 15.0, gripper_effort_nm: float = 2.0,
+                        gripper_open_mm: float = 60.0, step_delay_s: float = 1.2) -> None:
+        """
+        Закрывает захват ПРЯМО ИЗ ТЕКУЩЕЙ (уже подогнанной джойстиком) позы --
+        без дополнительного автоматического спуска -- и поднимает на lift_mm.
+
+        Почему без автоспуска: во время JOGGING высота (Z) уже находится под
+        ручным управлением через VRA (см. tick_jog()/apply_jog() в
+        pult_pickup_teleop.py). Если ПОСЛЕ того как оператор джойстиком/VRA
+        уже подвёл захват к самому предмету, ещё и автоматически опускать
+        руку на фиксированные descend_mm (как делает descend_grasp_lift()) --
+        рука проедет НИЖЕ, чем нужно, к столу/предмету. Используй этот метод,
+        если донастройка по Z уже приводит в позу непосредственно захвата.
+        Если же donastройка останавливается ВЫШЕ предмета (approach-высота) и
+        нужен ещё отдельный автоматический спуск перед хватом -- используй
+        descend_grasp_lift() вместо этого метода.
+        """
+        if self._jog_base is None:
+            raise RuntimeError("Сначала begin_jog()/apply_jog(), чтобы знать текущую позу")
+
+        current = EndPose(
+            x=self._jog_base.x + self._jog_offset["x"],
+            y=self._jog_base.y + self._jog_offset["y"],
+            z=self._jog_base.z + self._jog_offset["z"],
+            rx=self._jog_base.rx, ry=self._jog_base.ry, rz=self._jog_base.rz,
+        )
+
+        logger.info("[PiPER] === grasp_and_lift: старт (хват из текущей позы, без автоспуска) ===")
+        self.gripper(opening_mm=gripper_close_mm, effort_nm=gripper_effort_nm)
+        time.sleep(0.5)
+
+        up = EndPose(current.x, current.y, current.z + lift_mm, current.rx, current.ry, current.rz)
+        self.move_to_pose(up)
+        time.sleep(step_delay_s)
+        logger.info("[PiPER] === grasp_and_lift: готово, объект захвачен ===")
 
     def descend_grasp_lift(self, descend_mm: float = 60.0, lift_mm: float = 80.0,
                             gripper_close_mm: float = 15.0, gripper_open_mm: float = 60.0,
@@ -484,6 +605,11 @@ class PiperArmController:
         Из текущей (уже подогнанной джойстиком) позы: опуститься на
         descend_mm вниз, закрыть захват, подняться на lift_mm вверх.
         Вызывай после begin_jog()+несколько apply_jog().
+
+        ПРИМЕЧАНИЕ: если во время JOGGING оператор уже сам сводит Z вплотную
+        к предмету через VRA, этот метод даст ЛИШНИЙ спуск на descend_mm вниз
+        (см. предупреждение в grasp_and_lift() выше) -- в pult_pickup_teleop.py
+        по умолчанию используется grasp_and_lift(), а не этот метод.
         """
         if self._jog_base is None:
             raise RuntimeError("Сначала begin_jog()/apply_jog(), чтобы знать текущую позу")
@@ -574,8 +700,12 @@ class PiperArmController:
         try:
             self._piper.GripperCtrl(gripper_angle=angle, gripper_effort=effort, gripper_code=code)
         except Exception:
-            logger.exception("[PiPER] GripperCtrl(...) не удался -- команда НЕ ушла в CAN")
-            raise
+            logger.exception("[PiPER] GripperCtrl(...) попытка 1/2 не удалась -- повторяю")
+            try:
+                self._piper.GripperCtrl(gripper_angle=angle, gripper_effort=effort, gripper_code=code)
+            except Exception:
+                logger.exception("[PiPER] GripperCtrl(...) не удался -- команда НЕ ушла в CAN")
+                raise
 
     def emergency_stop(self) -> None:
         if self.dry_run:
