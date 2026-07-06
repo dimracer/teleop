@@ -3,7 +3,7 @@
 """
 agilex_platform.py
 
-Пряmaya (без ROS/ROS2) интеграция двух роботов AgileX на одном CAN-хосте:
+Прямая (без ROS/ROS2) интеграция двух роботов AgileX на одном CAN-хосте:
 
   - Bunker Mini 2.0   -> официальный пакет `pyagxrobots`
                          (https://github.com/agilexrobotics/pyagxrobots)
@@ -37,6 +37,17 @@ agilex_platform.py
     - Bunker перед выдачей скорости требует EnableCAN() -- тоже явный вызов.
     - dry_run=True (по умолчанию в демо ниже) не шлёт реальных команд в CAN,
       только логирует -- полезно, пока стенд не подключён физически.
+
+ВАЖНОЕ ИЗМЕНЕНИЕ (после разбора инцидента с "рука не двигается через раз"):
+    enable()/enable_joint_mode()/enable_end_pose_mode() теперь не просто
+    один раз шлют команду и надеются на лучшее -- они ПОДТВЕРЖДАЮТ результат
+    по обратной связи (GetArmEnableStatus()/GetArmStatus()) и повторяют
+    попытку при неудаче, громко сообщая об этом в лог. Раньше при потере
+    одного-единственного CAN-кадра EnableArm()/ModeCtrl() (например, сразу
+    после power-cycle руки) код молча считал, что всё включилось, и дальше
+    исправно "выполнял" сценарий в логах, хотя физически рука ничего не
+    получала. Подробности -- в README, раздел "Диагностика: рука не
+    реагирует не при каждом запуске".
 """
 
 from __future__ import annotations
@@ -154,6 +165,10 @@ class PiperArmController:
 
     Класс сам переключает ModeCtrl между joint/end-pose при вызове
     соответствующих методов -- вручную дёргать ModeCtrl не нужно.
+
+    enable()/enable_joint_mode()/enable_end_pose_mode() ПОДТВЕРЖДАЮТ результат
+    по фидбеку (GetArmEnableStatus()/GetArmStatus()) с повтором попыток --
+    см. docstring enable() ниже, почему это важно.
     """
 
     JOINT_LIMITS_DEG = {
@@ -168,6 +183,12 @@ class PiperArmController:
     # безопасная "коробка" ручного джога вокруг базовой позы (approach), мм
     JOG_XY_LIMIT_MM = 40.0
     JOG_Z_LIMIT_MM = 50.0
+
+    # сколько раз повторять EnableArm()/ModeCtrl(), если фидбек не подтвердил
+    ENABLE_RETRIES = 3
+    MODE_RETRIES = 3
+    CONFIRM_TIMEOUT_S = 1.5   # сколько ждём подтверждения после каждой попытки
+    CONFIRM_POLL_S = 0.05
 
     def __init__(self, can_name: str = "can_piper", dry_run: bool = True):
         self.can_name = can_name
@@ -197,6 +218,31 @@ class PiperArmController:
             return
         self._piper.ConnectPort()
 
+    # -- внутренние помощники: ждать подтверждения по фидбеку ---------------
+
+    def _wait_for(self, predicate) -> bool:
+        """Опрашивает predicate() до CONFIRM_TIMEOUT_S, пока не вернёт True."""
+        deadline = time.time() + self.CONFIRM_TIMEOUT_S
+        while time.time() < deadline:
+            try:
+                if predicate():
+                    return True
+            except Exception:
+                logger.exception("[PiPER] ошибка при проверке фидбека (см. трассировку)")
+            time.sleep(self.CONFIRM_POLL_S)
+        return False
+
+    def _ctrl_mode_feedback_is(self, ctrl_mode: int, move_mode: int) -> bool:
+        fb = self._piper.GetArmStatus()
+        st = fb.arm_status
+        return st.ctrl_mode == ctrl_mode and st.mode_feed == move_mode
+
+    def _all_motors_enabled(self) -> bool:
+        status = self._piper.GetArmEnableStatus()
+        return bool(status) and all(status)
+
+    # -- включение/выключение -------------------------------------------------
+
     def enable(self) -> None:
         """
         ВАЖНО (см. официальный PiPER Quick Start Manual, раздел 2.2):
@@ -204,20 +250,64 @@ class PiperArmController:
         физически находится в нулевой точке и drag-teach остановлен
         (индикатор между J5/J6 не горит). Эта проверка не автоматизирована --
         перед первым enable() на реальном стенде убедись в этом вручную.
+
+        В остальном метод сам:
+          1. Явно фиксирует роль "исполнительная рука" (motion output arm,
+             MasterSlaveConfig(0xFC,...)) -- чтобы исключить неоднозначность
+             master/slave-конфигурации, оставшуюся с прошлых сессий.
+          2. Шлёт EnableArm() и ждёт подтверждения по GetArmEnableStatus()
+             (все 6 моторов enabled). Если не подтвердилось -- повторяет
+             до ENABLE_RETRIES раз, иначе поднимает RuntimeError вместо
+             того чтобы молча считать, что всё включилось.
         """
         if self.dry_run:
             logger.info("[PiPER] (dry_run) EnableArm(7)")
-        else:
-            self._piper.EnableArm(motor_num=7, enable_flag=0x02)
+            self._enabled = True
+            self._move_mode = None
+            self.enable_joint_mode()
+            logger.info("[PiPER] enabled")
+            return
+
+        try:
+            self._piper.MasterSlaveConfig(0xFC, 0, 0, 0)
+        except Exception:
+            logger.exception("[PiPER] MasterSlaveConfig(0xFC,...) не удался (не критично, продолжаю)")
+
+        confirmed = False
+        for attempt in range(1, self.ENABLE_RETRIES + 1):
+            try:
+                self._piper.EnableArm(motor_num=7, enable_flag=0x02)
+            except Exception:
+                logger.exception("[PiPER] EnableArm() попытка %d/%d не удалась", attempt, self.ENABLE_RETRIES)
+
+            if self._wait_for(self._all_motors_enabled):
+                confirmed = True
+                break
+            logger.warning("[PiPER] enable не подтверждён по GetArmEnableStatus() "
+                            "(попытка %d/%d) -- повторяю", attempt, self.ENABLE_RETRIES)
+
+        if not confirmed:
+            raise RuntimeError(
+                "PiPER: не удалось подтвердить включение моторов после "
+                f"{self.ENABLE_RETRIES} попыток (GetArmEnableStatus() так и не стал all-True). "
+                "Проверь: рука в нулевой точке? drag-teach точно остановлен (индикатор погашен, "
+                "не мигает)? физическое подключение CAN_H/CAN_L и питание 24В? "
+                "См. README, раздел про диагностику."
+            )
+
         self._enabled = True
+        self._move_mode = None  # сбрасываем, чтобы ModeCtrl ниже точно переотправился и был подтверждён
         self.enable_joint_mode()
-        logger.info("[PiPER] enabled")
+        logger.info("[PiPER] enabled (подтверждено по GetArmEnableStatus)")
 
     def disable(self) -> None:
         if self.dry_run:
             logger.info("[PiPER] (dry_run) DisableArm(7)")
         else:
-            self._piper.DisableArm(motor_num=7, enable_flag=0x01)
+            try:
+                self._piper.DisableArm(motor_num=7, enable_flag=0x01)
+            except Exception:
+                logger.exception("[PiPER] DisableArm() не удался")
         self._enabled = False
         self._move_mode = None
         logger.info("[PiPER] disabled")
@@ -225,23 +315,63 @@ class PiperArmController:
     # -- переключение режима движения --------------------------------------
 
     def enable_joint_mode(self, speed_pct: int = 30) -> None:
-        """MOVE J -- нужен перед move_joints()/move_home()."""
+        """MOVE J -- нужен перед move_joints()/move_home(). Подтверждается по GetArmStatus()."""
         if self._move_mode == "joint":
             return
         if self.dry_run:
             logger.info("[PiPER] (dry_run) ModeCtrl(MOVE J, speed=%d%%)", speed_pct)
-        else:
-            self._piper.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=speed_pct)
+            self._move_mode = "joint"
+            return
+
+        confirmed = False
+        for attempt in range(1, self.MODE_RETRIES + 1):
+            try:
+                self._piper.ModeCtrl(ctrl_mode=0x01, move_mode=0x01, move_spd_rate_ctrl=speed_pct)
+            except Exception:
+                logger.exception("[PiPER] ModeCtrl(MOVE J) попытка %d/%d не удалась", attempt, self.MODE_RETRIES)
+
+            if self._wait_for(lambda: self._ctrl_mode_feedback_is(0x01, 0x01)):
+                confirmed = True
+                break
+            logger.warning("[PiPER] переход в MOVE J не подтверждён по GetArmStatus() "
+                            "(попытка %d/%d) -- повторяю", attempt, self.MODE_RETRIES)
+
+        if not confirmed:
+            raise RuntimeError(
+                "PiPER: не удалось подтвердить переход в MOVE J после "
+                f"{self.MODE_RETRIES} попыток (GetArmStatus().ctrl_mode/mode_feed не совпал). "
+                "Проверь состояние руки и CAN-подключение."
+            )
         self._move_mode = "joint"
 
     def enable_end_pose_mode(self, speed_pct: int = 20) -> None:
-        """MOVE L -- нужен перед move_to_pose()/begin_jog()/apply_jog(). Скорость ниже по умолчанию для точной донастройки."""
+        """MOVE L -- нужен перед move_to_pose()/begin_jog()/apply_jog(). Подтверждается по GetArmStatus()."""
         if self._move_mode == "end_pose":
             return
         if self.dry_run:
             logger.info("[PiPER] (dry_run) ModeCtrl(MOVE L, speed=%d%%)", speed_pct)
-        else:
-            self._piper.ModeCtrl(ctrl_mode=0x01, move_mode=0x02, move_spd_rate_ctrl=speed_pct)
+            self._move_mode = "end_pose"
+            return
+
+        confirmed = False
+        for attempt in range(1, self.MODE_RETRIES + 1):
+            try:
+                self._piper.ModeCtrl(ctrl_mode=0x01, move_mode=0x02, move_spd_rate_ctrl=speed_pct)
+            except Exception:
+                logger.exception("[PiPER] ModeCtrl(MOVE L) попытка %d/%d не удалась", attempt, self.MODE_RETRIES)
+
+            if self._wait_for(lambda: self._ctrl_mode_feedback_is(0x01, 0x02)):
+                confirmed = True
+                break
+            logger.warning("[PiPER] переход в MOVE L не подтверждён по GetArmStatus() "
+                            "(попытка %d/%d) -- повторяю", attempt, self.MODE_RETRIES)
+
+        if not confirmed:
+            raise RuntimeError(
+                "PiPER: не удалось подтвердить переход в MOVE L после "
+                f"{self.MODE_RETRIES} попыток (GetArmStatus().ctrl_mode/mode_feed не совпал). "
+                "Проверь состояние руки и CAN-подключение."
+            )
         self._move_mode = "end_pose"
 
     def _clip(self, joints: JointAngles) -> JointAngles:
@@ -263,7 +393,11 @@ class PiperArmController:
         if self.dry_run:
             logger.info("[PiPER] (dry_run) JointCtrl(%s)", (j1, j2, j3, j4, j5, j6))
             return
-        self._piper.JointCtrl(j1, j2, j3, j4, j5, j6)
+        try:
+            self._piper.JointCtrl(j1, j2, j3, j4, j5, j6)
+        except Exception:
+            logger.exception("[PiPER] JointCtrl(%s) не удался -- команда НЕ ушла в CAN", (j1, j2, j3, j4, j5, j6))
+            raise
 
     def move_home(self) -> None:
         self.move_joints(JointAngles(0, 0, 0, 0, 0, 0))
@@ -291,7 +425,11 @@ class PiperArmController:
             logger.info("[PiPER] (dry_run) EndPoseCtrl(x=%.1f, y=%.1f, z=%.1f, rx=%.1f, ry=%.1f, rz=%.1f)",
                         pose.x, pose.y, pose.z, pose.rx, pose.ry, pose.rz)
             return
-        self._piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+        try:
+            self._piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
+        except Exception:
+            logger.exception("[PiPER] EndPoseCtrl(...) не удался -- команда НЕ ушла в CAN")
+            raise
 
     def begin_jog(self, base_pose: Optional[EndPose] = None) -> EndPose:
         """
@@ -433,13 +571,20 @@ class PiperArmController:
             logger.info("[PiPER] (dry_run) GripperCtrl(angle=%d, effort=%d, code=%s)",
                         angle, effort, hex(code))
             return
-        self._piper.GripperCtrl(gripper_angle=angle, gripper_effort=effort, gripper_code=code)
+        try:
+            self._piper.GripperCtrl(gripper_angle=angle, gripper_effort=effort, gripper_code=code)
+        except Exception:
+            logger.exception("[PiPER] GripperCtrl(...) не удался -- команда НЕ ушла в CAN")
+            raise
 
     def emergency_stop(self) -> None:
         if self.dry_run:
             logger.info("[PiPER] (dry_run) EmergencyStop(0x01)")
             return
-        self._piper.EmergencyStop(emergency_stop=0x01)
+        try:
+            self._piper.EmergencyStop(emergency_stop=0x01)
+        except Exception:
+            logger.exception("[PiPER] EmergencyStop() не удался")
         self._enabled = False
 
     def get_joint_state(self) -> Optional[dict]:
