@@ -2,6 +2,7 @@
 # coding=utf-8
 """
 agilex_platform.py
+(rev: move_joints(wait_settle=True) теперь с ретраями и контролем по фидбеку)
 
 Прямая (без ROS/ROS2) интеграция двух роботов AgileX на одном CAN-хосте:
 
@@ -194,6 +195,12 @@ class PiperArmController:
     MOVE_SETTLE_TIMEOUT_S = 5.0
     MOVE_SETTLE_POLL_S = 0.1
     MOVE_SETTLE_TOL_DEG = 1.5
+    # надёжная доставка JointCtrl при wait_settle=True: сколько раз переотправлять
+    # команду, если рука не подтвердила приход в позу, и как быстро распознавать
+    # "команда потерялась" (рука вообще не начала двигаться)
+    MOVE_SEND_RETRIES = 3
+    MOVE_NO_PROGRESS_TIMEOUT_S = 1.2   # нет движения дольше этого -> переотправка сразу
+    MOVE_PROGRESS_TOL_DEG = 0.5        # суставы сдвинулись больше этого -> считаем "движется"
 
     # как часто во время джога перепроверяем реальный режим руки по фидбеку
     # (а не просто доверяем закэшированному self._move_mode) -- см. apply_jog()
@@ -392,51 +399,117 @@ class PiperArmController:
             clipped[name] = max(lo, min(hi, v))
         return JointAngles(**clipped)
 
-    def move_joints(self, joints: JointAngles, wait_settle: bool = False) -> None:
+    def _send_joint_ctrl(self, j_milli: tuple[int, int, int, int, int, int]) -> None:
+        """Отправляет JointCtrl с одним быстрым повтором при исключении отправки."""
+        try:
+            self._piper.JointCtrl(*j_milli)
+        except Exception:
+            logger.exception("[PiPER] JointCtrl(%s) попытка 1/2 не удалась -- повторяю", (j_milli,))
+            try:
+                self._piper.JointCtrl(*j_milli)
+            except Exception:
+                logger.exception("[PiPER] JointCtrl(%s) не удался -- команда НЕ ушла в CAN", (j_milli,))
+                raise
+
+    def _max_joint_delta_deg(self, a: JointAngles, b: JointAngles) -> float:
+        return max(abs(getattr(a, n) - getattr(b, n))
+                   for n in ("j1", "j2", "j3", "j4", "j5", "j6"))
+
+    def move_joints(self, joints: JointAngles, wait_settle: bool = False) -> bool:
         """
         wait_settle=True: не возвращаться, пока рука реально не придёт в целевую
-        позу (по фидбеку GetArmJointMsgs(), с допуском MOVE_SETTLE_TOL_DEG и
-        таймаутом MOVE_SETTLE_TIMEOUT_S) -- вместо того чтобы гадать фиксированной
-        задержкой time.sleep(...). Это важно перед тем, как что-то ещё читает
-        текущую позу руки (например begin_jog() в pult_pickup_teleop.py) --
-        иначе можно случайно снять позу "на лету", в середине движения, и
-        каждый раз получать чуть разную точку (см. README, диагностика).
+        позу (по фидбеку GetArmJointMsgs(), с допуском MOVE_SETTLE_TOL_DEG).
+
+        ВАЖНО (исправление "SWD не всегда доводит руку в APPROACH"): раньше
+        JointCtrl отправлялся ровно ОДИН раз. Успешная запись в CAN-сокет не
+        гарантирует, что кадр дошёл до прошивки и был принят -- потерянный/
+        проигнорированный кадр не вызывает исключения, рука просто стоит,
+        wait_settle честно ждал 5с, писал warning и код шёл дальше. Повторное
+        нажатие SWD "чинило" это только потому, что переотправляло команду.
+        Теперь при wait_settle=True метод сам добивается результата:
+
+          1. Перед каждой попыткой сверяет РЕАЛЬНЫЙ режим руки по GetArmStatus()
+             (а не закэшированный self._move_mode -- кэш может разойтись с
+             прошивкой, тот же класс бага, что уже чинили в apply_jog()).
+          2. Отправляет JointCtrl и следит за фидбеком: если рука вообще не
+             начала двигаться за MOVE_NO_PROGRESS_TIMEOUT_S (кадр потерян) --
+             переотправляет сразу, не дожидаясь полного таймаута.
+          3. Всего до MOVE_SEND_RETRIES попыток; каждая с полным таймаутом
+             MOVE_SETTLE_TIMEOUT_S на доезд.
+
+        Возвращает True, если приход в позу подтверждён по фидбеку (в dry_run --
+        всегда True), False -- если все попытки исчерпаны (в лог уходит error;
+        вызывающий код сам решает, что делать -- см. _enter_jogging() в
+        pult_pickup_teleop.py).
         """
         if not self._enabled:
             raise RuntimeError("PiPER не включён: вызови enable() перед движением")
         self.enable_joint_mode()
 
         joints = self._clip(joints)
-        j1, j2, j3, j4, j5, j6 = joints.as_millidegrees()
+        j_milli = joints.as_millidegrees()
 
         if self.dry_run:
-            logger.info("[PiPER] (dry_run) JointCtrl(%s)", (j1, j2, j3, j4, j5, j6))
-            return
+            logger.info("[PiPER] (dry_run) JointCtrl(%s)", j_milli)
+            return True
 
-        try:
-            self._piper.JointCtrl(j1, j2, j3, j4, j5, j6)
-        except Exception:
-            logger.exception("[PiPER] JointCtrl(%s) попытка 1/2 не удалась -- повторяю",
-                              (j1, j2, j3, j4, j5, j6))
+        if not wait_settle:
+            self._send_joint_ctrl(j_milli)
+            return True
+
+        for attempt in range(1, self.MOVE_SEND_RETRIES + 1):
+            # 1) сверяем реальный режим по фидбеку, а не по кэшу
             try:
-                self._piper.JointCtrl(j1, j2, j3, j4, j5, j6)
+                if not self._ctrl_mode_feedback_is(0x01, 0x01):
+                    logger.warning("[PiPER] move_joints: реальный режим руки != MOVE J "
+                                    "(попытка %d/%d) -- переотправляю ModeCtrl",
+                                    attempt, self.MOVE_SEND_RETRIES)
+                    self._move_mode = None
+                    self.enable_joint_mode()
             except Exception:
-                logger.exception("[PiPER] JointCtrl(%s) не удался -- команда НЕ ушла в CAN",
-                                  (j1, j2, j3, j4, j5, j6))
-                raise
+                logger.exception("[PiPER] move_joints: не удалось проверить режим (продолжаю)")
 
-        if wait_settle:
+            # 2) отправляем команду и ждём по фидбеку
+            self._send_joint_ctrl(j_milli)
+
+            start_pose = self.get_joint_angles_deg()
+            started_moving = False
+            progress_deadline = time.time() + self.MOVE_NO_PROGRESS_TIMEOUT_S
             deadline = time.time() + self.MOVE_SETTLE_TIMEOUT_S
+
             while time.time() < deadline:
                 if self._joints_close(joints):
-                    return
+                    if attempt > 1:
+                        logger.info("[PiPER] move_joints: цель подтверждена с попытки %d", attempt)
+                    return True
+
+                if not started_moving and start_pose is not None:
+                    cur = self.get_joint_angles_deg()
+                    if cur is not None and \
+                            self._max_joint_delta_deg(cur, start_pose) > self.MOVE_PROGRESS_TOL_DEG:
+                        started_moving = True
+
+                # рука так и не стронулась -> кадр, скорее всего, потерян: не ждём
+                # полный таймаут, идём переотправлять
+                if not started_moving and time.time() >= progress_deadline:
+                    logger.warning("[PiPER] move_joints: рука не начала движение за %.1fс "
+                                    "(попытка %d/%d, вероятно потерян кадр JointCtrl) -- переотправляю",
+                                    self.MOVE_NO_PROGRESS_TIMEOUT_S, attempt, self.MOVE_SEND_RETRIES)
+                    break
+
                 time.sleep(self.MOVE_SETTLE_POLL_S)
-            logger.warning(
-                "[PiPER] move_joints: рука не подтвердила приход в целевую позу за %.1fс "
-                "(GetArmJointMsgs() так и не сошёлся в пределах %.1f°) -- продолжаю всё равно, "
-                "но следующая captured поза может быть не окончательной",
-                self.MOVE_SETTLE_TIMEOUT_S, self.MOVE_SETTLE_TOL_DEG,
-            )
+            else:
+                logger.warning("[PiPER] move_joints: движение началось, но рука не сошлась к цели "
+                                "за %.1fс (попытка %d/%d) -- переотправляю",
+                                self.MOVE_SETTLE_TIMEOUT_S, attempt, self.MOVE_SEND_RETRIES)
+
+        logger.error(
+            "[PiPER] move_joints: рука НЕ подтвердила приход в целевую позу после %d попыток "
+            "(GetArmJointMsgs() не сошёлся в пределах %.1f°). Проверь CAN-подключение и "
+            "нет ли механического препятствия. Продолжаю, но текущая поза руки -- не целевая.",
+            self.MOVE_SEND_RETRIES, self.MOVE_SETTLE_TOL_DEG,
+        )
+        return False
 
     def move_home(self) -> None:
         self.move_joints(JointAngles(0, 0, 0, 0, 0, 0), wait_settle=True)
