@@ -212,8 +212,8 @@ class PiperArmController:
     # J1=150° -- максимум в пределах программного лимита (физический предел
     # PiPER ±154°, ровно 180° невозможно); знак поменяй, если сбрасывать надо
     # в другую сторону. DROP_LOWER_PCT=0.40 -- согласованные 40% (диапазон 30-50%).
-    TURN_J1_TARGET_DEG = 150.0
-    DROP_LOWER_PCT = 0.40
+    TURN_J1_TARGET_DEG = -150.0
+    DROP_LOWER_PCT = 0.30
 
     # как часто во время джога перепроверяем реальный режим руки по фидбеку
     # (а не просто доверяем закэшированному self._move_mode) -- см. apply_jog()
@@ -713,8 +713,9 @@ class PiperArmController:
         # 2) спуск через J2/J3: углы по модулю больше -> рука ниже
         lowered = JointAngles(j1=turn_j1,
                                j2=turned.j2 * (1.0 + pct),
-                               j3=turned.j3 * (1.0 + pct),
-                               j4=turned.j4, j5=turned.j5, j6=turned.j6)
+                               j3=turned.j3 * (1.0 - pct),
+                               j4=turned.j4 * (1.0 + pct), 
+                               j5=turned.j5, j6=turned.j6)
         ok &= self.move_joints(lowered, wait_settle=True)
 
         # 3) отпустить

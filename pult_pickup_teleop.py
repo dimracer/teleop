@@ -71,7 +71,7 @@ logger = logging.getLogger("pult_pickup_teleop")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ЗАГЛУШКА -- обязательно откалибровать под свой стол/предмет
-APPROACH = JointAngles(j1=0, j2=40, j3=-60, j4=0, j5=20, j6=0)
+APPROACH = JointAngles(j1=0, j2=86, j3=-120, j4=5, j5=28, j6=15)
 
 # насколько мм двигаем захват за один тик поллинга при полном отклонении стика
 JOG_MM_PER_TICK = 2.0
@@ -288,4 +288,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
- 
