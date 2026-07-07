@@ -2,7 +2,7 @@
 # coding=utf-8
 """
 agilex_platform.py
-(rev: move_joints(wait_settle=True) теперь с ретраями и контролем по фидбеку)
+(rev: пара ModeCtrl+команда движения, как в примерах piper_sdk; grasp_hold; turn_lower_release_home)
 
 Прямая (без ROS/ROS2) интеграция двух роботов AgileX на одном CAN-хосте:
 
@@ -195,12 +195,25 @@ class PiperArmController:
     MOVE_SETTLE_TIMEOUT_S = 5.0
     MOVE_SETTLE_POLL_S = 0.1
     MOVE_SETTLE_TOL_DEG = 1.5
-    # надёжная доставка JointCtrl при wait_settle=True: сколько раз переотправлять
-    # команду, если рука не подтвердила приход в позу, и как быстро распознавать
-    # "команда потерялась" (рука вообще не начала двигаться)
-    MOVE_SEND_RETRIES = 3
-    MOVE_NO_PROGRESS_TIMEOUT_S = 1.2   # нет движения дольше этого -> переотправка сразу
-    MOVE_PROGRESS_TOL_DEG = 0.5        # суставы сдвинулись больше этого -> считаем "движется"
+    # надёжная доставка при wait_settle=True: пара ModeCtrl+JointCtrl периодически
+    # переотправляется, пока фидбек не подтвердит приход в позу (официальные
+    # примеры piper_sdk шлют MotionCtrl_2/ModeCtrl перед КАЖДОЙ командой движения,
+    # в каждой итерации цикла -- см. docstring move_joints)
+    MOVE_SEND_RETRIES = 3              # внешних попыток (каждая с полным таймаутом)
+    MOVE_RESEND_PERIOD_S = 1.0         # период переотправки пары внутри попытки
+
+    # штатные скорости режимов (проценты) -- используются и в подтверждаемом
+    # переключении режима, и в паре ModeCtrl+команда
+    JOINT_SPEED_PCT = 30
+    ENDPOSE_SPEED_PCT = 20
+
+    # разворот-сброс (turn_lower_release_home): куда крутить J1 и насколько
+    # опускать руку через J2/J3 перед отпусканием. ЗАГЛУШКИ ПОД КАЛИБРОВКУ:
+    # J1=150° -- максимум в пределах программного лимита (физический предел
+    # PiPER ±154°, ровно 180° невозможно); знак поменяй, если сбрасывать надо
+    # в другую сторону. DROP_LOWER_PCT=0.40 -- согласованные 40% (диапазон 30-50%).
+    TURN_J1_TARGET_DEG = 150.0
+    DROP_LOWER_PCT = 0.40
 
     # как часто во время джога перепроверяем реальный режим руки по фидбеку
     # (а не просто доверяем закэшированному self._move_mode) -- см. apply_jog()
@@ -411,36 +424,49 @@ class PiperArmController:
                 logger.exception("[PiPER] JointCtrl(%s) не удался -- команда НЕ ушла в CAN", (j_milli,))
                 raise
 
-    def _max_joint_delta_deg(self, a: JointAngles, b: JointAngles) -> float:
-        return max(abs(getattr(a, n) - getattr(b, n))
-                   for n in ("j1", "j2", "j3", "j4", "j5", "j6"))
+    def _send_mode_ctrl_frame(self, move_mode: int, speed_pct: int) -> None:
+        """
+        Отправляет ОДИН кадр ModeCtrl без ожидания подтверждения.
+
+        Зачем: официальные примеры piper_sdk шлют MotionCtrl_2/ModeCtrl перед
+        КАЖДОЙ командой движения (в каждой итерации цикла), а не один раз при
+        "смене режима". На стенде выяснилось, что одиночный JointCtrl без
+        свежего ModeCtrl прошивка может проигнорировать -- именно поэтому SWD
+        срабатывал только со 2-3-го нажатия: помогало лишь то нажатие, перед
+        которым код был вынужден переслать ModeCtrl (после begin_jog режим
+        "уезжал" в MOVE L, и расхождение заставляло переотправить).
+        """
+        try:
+            self._piper.ModeCtrl(ctrl_mode=0x01, move_mode=move_mode,
+                                  move_spd_rate_ctrl=speed_pct)
+        except Exception:
+            logger.exception("[PiPER] ModeCtrl-кадр перед командой движения не отправился "
+                              "(продолжаю, команда всё равно уйдёт)")
 
     def move_joints(self, joints: JointAngles, wait_settle: bool = False) -> bool:
         """
         wait_settle=True: не возвращаться, пока рука реально не придёт в целевую
         позу (по фидбеку GetArmJointMsgs(), с допуском MOVE_SETTLE_TOL_DEG).
 
-        ВАЖНО (исправление "SWD не всегда доводит руку в APPROACH"): раньше
-        JointCtrl отправлялся ровно ОДИН раз. Успешная запись в CAN-сокет не
-        гарантирует, что кадр дошёл до прошивки и был принят -- потерянный/
-        проигнорированный кадр не вызывает исключения, рука просто стоит,
-        wait_settle честно ждал 5с, писал warning и код шёл дальше. Повторное
-        нажатие SWD "чинило" это только потому, что переотправляло команду.
-        Теперь при wait_settle=True метод сам добивается результата:
+        КАК ДОСТАВЛЯЕТСЯ КОМАНДА (исправление "SWD доводит руку в APPROACH
+        только со 2-3-го нажатия" -- вторая итерация). Первая попытка фикса
+        (переотправка одиночного JointCtrl по таймауту) на стенде НЕ помогла:
+        проблема не в потере кадра, а в том, что прошивка игнорирует JointCtrl
+        без свежего ModeCtrl перед ним. Официальные примеры piper_sdk шлют
+        MotionCtrl_2/ModeCtrl + команду движения ПАРОЙ в каждой итерации цикла.
+        Теперь так же делаем и мы:
 
-          1. Перед каждой попыткой сверяет РЕАЛЬНЫЙ режим руки по GetArmStatus()
-             (а не закэшированный self._move_mode -- кэш может разойтись с
-             прошивкой, тот же класс бага, что уже чинили в apply_jog()).
-          2. Отправляет JointCtrl и следит за фидбеком: если рука вообще не
-             начала двигаться за MOVE_NO_PROGRESS_TIMEOUT_S (кадр потерян) --
-             переотправляет сразу, не дожидаясь полного таймаута.
-          3. Всего до MOVE_SEND_RETRIES попыток; каждая с полным таймаутом
-             MOVE_SETTLE_TIMEOUT_S на доезд.
+          1. Перед каждой попыткой реальный режим сверяется по GetArmStatus()
+             (не по кэшу) и при расхождении восстанавливается с подтверждением.
+          2. Пара "ModeCtrl(MOVE J) + JointCtrl" отправляется сразу и затем
+             переотправляется каждые MOVE_RESEND_PERIOD_S, пока фидбек не
+             подтвердит приход в позу (переотправка той же целевой позы в
+             MOVE J безопасна -- это позиционная команда, не приращение).
+          3. Всего до MOVE_SEND_RETRIES внешних попыток по MOVE_SETTLE_TIMEOUT_S.
 
-        Возвращает True, если приход в позу подтверждён по фидбеку (в dry_run --
-        всегда True), False -- если все попытки исчерпаны (в лог уходит error;
-        вызывающий код сам решает, что делать -- см. _enter_jogging() в
-        pult_pickup_teleop.py).
+        Возвращает True, если приход подтверждён по фидбеку (в dry_run -- всегда
+        True), False -- если все попытки исчерпаны (в лог уходит error; вызывающий
+        код сам решает, что делать -- см. _enter_jogging() в pult_pickup_teleop.py).
         """
         if not self._enabled:
             raise RuntimeError("PiPER не включён: вызови enable() перед движением")
@@ -450,10 +476,11 @@ class PiperArmController:
         j_milli = joints.as_millidegrees()
 
         if self.dry_run:
-            logger.info("[PiPER] (dry_run) JointCtrl(%s)", j_milli)
+            logger.info("[PiPER] (dry_run) ModeCtrl(MOVE J)+JointCtrl(%s)", j_milli)
             return True
 
         if not wait_settle:
+            self._send_mode_ctrl_frame(0x01, self.JOINT_SPEED_PCT)
             self._send_joint_ctrl(j_milli)
             return True
 
@@ -462,46 +489,31 @@ class PiperArmController:
             try:
                 if not self._ctrl_mode_feedback_is(0x01, 0x01):
                     logger.warning("[PiPER] move_joints: реальный режим руки != MOVE J "
-                                    "(попытка %d/%d) -- переотправляю ModeCtrl",
+                                    "(попытка %d/%d) -- восстанавливаю с подтверждением",
                                     attempt, self.MOVE_SEND_RETRIES)
                     self._move_mode = None
                     self.enable_joint_mode()
             except Exception:
                 logger.exception("[PiPER] move_joints: не удалось проверить режим (продолжаю)")
 
-            # 2) отправляем команду и ждём по фидбеку
-            self._send_joint_ctrl(j_milli)
-
-            start_pose = self.get_joint_angles_deg()
-            started_moving = False
-            progress_deadline = time.time() + self.MOVE_NO_PROGRESS_TIMEOUT_S
+            # 2) пара ModeCtrl+JointCtrl с периодической переотправкой до подтверждения
             deadline = time.time() + self.MOVE_SETTLE_TIMEOUT_S
-
+            next_send = 0.0
             while time.time() < deadline:
+                if time.time() >= next_send:
+                    self._send_mode_ctrl_frame(0x01, self.JOINT_SPEED_PCT)
+                    self._send_joint_ctrl(j_milli)
+                    next_send = time.time() + self.MOVE_RESEND_PERIOD_S
+
                 if self._joints_close(joints):
                     if attempt > 1:
                         logger.info("[PiPER] move_joints: цель подтверждена с попытки %d", attempt)
                     return True
-
-                if not started_moving and start_pose is not None:
-                    cur = self.get_joint_angles_deg()
-                    if cur is not None and \
-                            self._max_joint_delta_deg(cur, start_pose) > self.MOVE_PROGRESS_TOL_DEG:
-                        started_moving = True
-
-                # рука так и не стронулась -> кадр, скорее всего, потерян: не ждём
-                # полный таймаут, идём переотправлять
-                if not started_moving and time.time() >= progress_deadline:
-                    logger.warning("[PiPER] move_joints: рука не начала движение за %.1fс "
-                                    "(попытка %d/%d, вероятно потерян кадр JointCtrl) -- переотправляю",
-                                    self.MOVE_NO_PROGRESS_TIMEOUT_S, attempt, self.MOVE_SEND_RETRIES)
-                    break
-
                 time.sleep(self.MOVE_SETTLE_POLL_S)
-            else:
-                logger.warning("[PiPER] move_joints: движение началось, но рука не сошлась к цели "
-                                "за %.1fс (попытка %d/%d) -- переотправляю",
-                                self.MOVE_SETTLE_TIMEOUT_S, attempt, self.MOVE_SEND_RETRIES)
+
+            logger.warning("[PiPER] move_joints: рука не сошлась к цели за %.1fс "
+                            "(попытка %d/%d)", self.MOVE_SETTLE_TIMEOUT_S,
+                            attempt, self.MOVE_SEND_RETRIES)
 
         logger.error(
             "[PiPER] move_joints: рука НЕ подтвердила приход в целевую позу после %d попыток "
@@ -511,8 +523,8 @@ class PiperArmController:
         )
         return False
 
-    def move_home(self) -> None:
-        self.move_joints(JointAngles(0, 0, 0, 0, 0, 0), wait_settle=True)
+    def move_home(self) -> bool:
+        return self.move_joints(JointAngles(0, 0, 0, 0, 0, 0), wait_settle=True)
 
     # -- декартовы движения (MOVE L) для ручной донастройки -----------------
 
@@ -557,9 +569,13 @@ class PiperArmController:
 
         X, Y, Z, RX, RY, RZ = pose.as_milli()
         if self.dry_run:
-            logger.info("[PiPER] (dry_run) EndPoseCtrl(x=%.1f, y=%.1f, z=%.1f, rx=%.1f, ry=%.1f, rz=%.1f)",
+            logger.info("[PiPER] (dry_run) ModeCtrl(MOVE L)+EndPoseCtrl(x=%.1f, y=%.1f, z=%.1f, rx=%.1f, ry=%.1f, rz=%.1f)",
                         pose.x, pose.y, pose.z, pose.rx, pose.ry, pose.rz)
             return
+        # пара ModeCtrl+команда -- как в официальных примерах piper_sdk
+        # (см. _send_mode_ctrl_frame): без свежего ModeCtrl команда движения
+        # может быть молча проигнорирована прошивкой
+        self._send_mode_ctrl_frame(0x02, self.ENDPOSE_SPEED_PCT)
         try:
             self._piper.EndPoseCtrl(X, Y, Z, RX, RY, RZ)
         except Exception:
@@ -633,6 +649,88 @@ class PiperArmController:
 
         self.move_to_pose(target)
         return target
+
+    def grasp_hold(self, gripper_close_mm: float = 15.0,
+                    gripper_effort_nm: float = 2.0) -> None:
+        """
+        Закрывает захват ПРЯМО ИЗ ТЕКУЩЕЙ (уже подогнанной джойстиком) позы
+        и ДЕРЖИТ -- никакого автоподъёма.
+
+        Почему без подъёма: на стенде подъём на 80мм сразу после хвата
+        (grasp_and_lift) выглядел как резкий рывок вверх. По согласованию
+        автоподъём убран совсем: SWA из JOGGING теперь только закрывает
+        захват; подъём/перенос выполняет отдельный шаг разворота-сброса
+        (turn_lower_release_home(), второй SWA). Старый grasp_and_lift()
+        оставлен в коде на случай, если подъём после хвата понадобится снова.
+        """
+        if self._jog_base is None:
+            raise RuntimeError("Сначала begin_jog()/apply_jog(), чтобы знать текущую позу")
+
+        logger.info("[PiPER] === grasp_hold: закрываю захват из текущей позы, держу ===")
+        self.gripper(opening_mm=gripper_close_mm, effort_nm=gripper_effort_nm)
+        time.sleep(0.5)
+        logger.info("[PiPER] === grasp_hold: готово, объект захвачен ===")
+
+    def turn_lower_release_home(self,
+                                  fallback_joints: Optional[JointAngles] = None,
+                                  turn_j1_deg: Optional[float] = None,
+                                  lower_pct: Optional[float] = None,
+                                  gripper_open_mm: float = 60.0) -> bool:
+        """
+        Разворот-сброс (состояние TURNING в pult_pickup_teleop.py), выполняется
+        по второму нажатию SWA из HOLDING:
+
+          1. J1 разворачивается к TURN_J1_TARGET_DEG (150° -- максимум в пределах
+             лимита; физический предел PiPER ±154°, ровно 180° невозможно),
+             остальные суставы остаются как при захвате.
+          2. Рука опускается через J2/J3: их углы увеличиваются по модулю на
+             lower_pct (DROP_LOWER_PCT=40%) -- локоть/плечо "складываются" вниз.
+          3. Захват отпускается.
+          4. Рука уходит в zero point (move_home).
+
+        fallback_joints -- поза для dry_run (нет фидбека) и на случай сбоя чтения.
+        Каждый переезд идёт через move_joints(wait_settle=True) -- с парой
+        ModeCtrl+JointCtrl, переотправкой и подтверждением по фидбеку.
+        Возвращает True, если ВСЕ шаги подтверждены.
+        """
+        if not self._enabled:
+            raise RuntimeError("PiPER не включён: вызови enable() перед движением")
+
+        turn_j1 = self.TURN_J1_TARGET_DEG if turn_j1_deg is None else turn_j1_deg
+        pct = self.DROP_LOWER_PCT if lower_pct is None else lower_pct
+
+        cur = self.get_joint_angles_deg() or fallback_joints or JointAngles()
+        ok = True
+
+        logger.info("[PiPER] === turn_lower_release_home: старт (J1 -> %.0f°, спуск J2/J3 на %.0f%%) ===",
+                    turn_j1, pct * 100)
+
+        # 1) разворот J1 (остальные суставы держим как при захвате)
+        turned = JointAngles(j1=turn_j1, j2=cur.j2, j3=cur.j3,
+                              j4=cur.j4, j5=cur.j5, j6=cur.j6)
+        ok &= self.move_joints(turned, wait_settle=True)
+
+        # 2) спуск через J2/J3: углы по модулю больше -> рука ниже
+        lowered = JointAngles(j1=turn_j1,
+                               j2=turned.j2 * (1.0 + pct),
+                               j3=turned.j3 * (1.0 + pct),
+                               j4=turned.j4, j5=turned.j5, j6=turned.j6)
+        ok &= self.move_joints(lowered, wait_settle=True)
+
+        # 3) отпустить
+        self.gripper(opening_mm=gripper_open_mm)
+        time.sleep(0.5)
+        self._jog_base = None
+
+        # 4) zero point
+        ok &= self.move_home()
+
+        if ok:
+            logger.info("[PiPER] === turn_lower_release_home: готово, рука в zero point ===")
+        else:
+            logger.error("[PiPER] turn_lower_release_home: не все шаги подтверждены по фидбеку "
+                          "-- проверь фактическую позу руки перед следующим циклом")
+        return ok
 
     def grasp_and_lift(self, lift_mm: float = 80.0,
                         gripper_close_mm: float = 15.0, gripper_effort_nm: float = 2.0,

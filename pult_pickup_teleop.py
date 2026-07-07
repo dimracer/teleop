@@ -2,7 +2,7 @@
 # coding=utf-8
 """
 pult_pickup_teleop.py
-(rev: надёжный SWD->APPROACH, см. _enter_jogging и move_joints)
+(rev: пара ModeCtrl+команда; захват без автоподъёма; состояние TURNING)
 
 Сценарий "подъехал на штатном пульте Bunker Mini 2.0 -> рукой PiPER взял
 предмет", с ручной донастройкой позы захвата под правым джойстиком и
@@ -20,16 +20,20 @@ pult_pickup_teleop.py
                               джойстиком/VRA, отдельного автоспуска перед
                               хватом больше нет (см. grasp_and_lift() ниже)
     SWA -> down (из JOGGING): закрыть захват ПРЯМО ИЗ ТЕКУЩЕЙ (уже подогнанной
-                              джойстиком/VRA) позы и подняться -> HOLDING
-    SWA -> down (из HOLDING): отпустить предмет, вернуть руку в home ->
-                              состояние IDLE
+                              джойстиком/VRA) позы и ДЕРЖАТЬ -> HOLDING
+                              (автоподъёма больше нет: на стенде он выглядел
+                              как резкий рывок вверх, убран по согласованию)
+    SWA -> down (из HOLDING): РАЗВОРОТ-СБРОС (состояние TURNING, автоматически):
+                              J1 -> 150° (180° физически недоступно, лимит
+                              PiPER ±154°), спуск через J2/J3 на 40%,
+                              отпустить захват, zero point -> IDLE
     SWD -> down (из JOGGING): реально вернуть руку в базовую approach-позу
                               (move_joints(APPROACH)) и заново включить
                               донастройку с нуля (было -- просто "забывало"
                               текущий сдвиг, руку никуда не двигая)
 
 State machine:
-    IDLE --SWD--> JOGGING --SWA--> HOLDING --SWA--> IDLE
+    IDLE --SWD--> JOGGING --SWA--> HOLDING --SWA--> TURNING --(авто)--> IDLE
               ^______________SWD (reset)_____|
 
 БЕЗОПАСНОСТЬ:
@@ -79,6 +83,7 @@ class State(Enum):
     IDLE = auto()
     JOGGING = auto()
     HOLDING = auto()
+    TURNING = auto()   # разворот-сброс: J1->150°, спуск J2/J3, отпустить, zero point
 
 
 class PickupTeleop:
@@ -145,14 +150,24 @@ class PickupTeleop:
 
     def _on_swa_down(self, s: RcState) -> None:
         if self.state == State.JOGGING:
-            logger.info(">>> JOGGING -> HOLDING: хват из текущей (уже подогнанной джойстиком) позы")
-            self.arm.grasp_and_lift()
+            logger.info(">>> JOGGING -> HOLDING: хват из текущей (уже подогнанной джойстиком) позы, "
+                        "без автоподъёма")
+            self.arm.grasp_hold()
             self.state = State.HOLDING
 
         elif self.state == State.HOLDING:
-            logger.info(">>> HOLDING -> IDLE: отпускаю предмет, домой")
-            self.arm.release_and_home()
-            self.state = State.IDLE
+            logger.info(">>> HOLDING -> TURNING: разворот J1, спуск J2/J3, отпустить, zero point")
+            self.state = State.TURNING
+            try:
+                ok = self.arm.turn_lower_release_home(fallback_joints=APPROACH)
+                if not ok:
+                    logger.error("TURNING: не все шаги подтверждены по фидбеку -- "
+                                  "проверь фактическую позу руки")
+            finally:
+                # в IDLE в любом случае: рука либо в zero point, либо об ошибке
+                # уже громко сказано выше; следующий цикл начинается с SWD
+                self.state = State.IDLE
+            logger.info(">>> TURNING -> IDLE")
 
         else:
             logger.info("SWA в состоянии %s игнорируется (нечего отпускать)", self.state)
@@ -228,7 +243,7 @@ def run_demo() -> None:
         rc._process_state(st)
         return st
 
-    logger.info("=== DEMO: подъехали -> approach -> ручная донастройка джойстиком -> захват -> отпустить ===")
+    logger.info("=== DEMO: подъехали -> approach -> донастройка джойстиком -> захват -> разворот-сброс ===")
 
     push(count=1)  # состояние покоя
 
@@ -242,11 +257,12 @@ def run_demo() -> None:
         teleop.tick_jog(st)
 
     time.sleep(0.2)
-    logger.info("-> SWA down: захват из текущей (подогнанной) позы")
+    logger.info("-> SWA down: захват из текущей (подогнанной) позы, без автоподъёма")
     push(swa=3, swd=3, count=10)
 
     time.sleep(0.2)
-    logger.info("-> SWA down: отпустить и вернуться домой")
+    logger.info("-> SWA down (повторно): разворот J1 -> 150°, спуск J2/J3 на 40%, "
+                "отпустить, zero point")
     push(swa=2, swd=3, count=11)  # сначала отпускаем SWA (up), чтобы поймать следующий edge
     push(swa=3, swd=3, count=12)
 
@@ -272,3 +288,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+ 
