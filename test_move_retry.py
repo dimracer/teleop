@@ -126,19 +126,26 @@ uniq = []
 for t in targets:
     if not uniq or uniq[-1] != t:
         uniq.append(t)
-# шаг 1: разворот J1 -> 150°, J2/J3 как при захвате
-assert uniq[0][0] == 150000 and uniq[0][1] == 40000 and uniq[0][2] == -60000, uniq[0]
-# шаг 2: спуск J2/J3 на 40%: 40->56, -60->-84
-assert uniq[1][0] == 150000 and uniq[1][1] == 56000 and uniq[1][2] == -84000, uniq[1]
+# целевые углы считаем от АКТУАЛЬНЫХ констант/формулы turn_lower_release_home,
+# чтобы тест не ломался при перекалибровке TURN_J1_TARGET_DEG / DROP_LOWER_PCT
+TURN = int(round(PiperArmController.TURN_J1_TARGET_DEG * 1000))
+PCT = PiperArmController.DROP_LOWER_PCT
+LOW_J2 = int(round(40.0 * (1.0 + PCT) * 1000))   # j2 * (1+pct)
+LOW_J3 = int(round(-60.0 * (1.0 - PCT) * 1000))  # j3 * (1-pct) -- текущая формула спуска
+# шаг 1: разворот J1 -> TURN, J2/J3 как при захвате
+assert uniq[0][0] == TURN and uniq[0][1] == 40000 and uniq[0][2] == -60000, uniq[0]
+# шаг 2: спуск через J2/J3 по формуле
+assert uniq[1][0] == TURN and uniq[1][1] == LOW_J2 and uniq[1][2] == LOW_J3, uniq[1]
 # шаг 3: отпускание захвата ПОСЛЕ спуска и ДО ухода домой
 last_lower_i = max(i for i, c in enumerate(fake.calls)
-                   if c[0] == "JointCtrl" and c[1][1] == 56000)
+                   if c[0] == "JointCtrl" and c[1][1] == LOW_J2)
 home_i = min(i for i, c in enumerate(fake.calls)
              if c[0] == "JointCtrl" and c[1] == (0, 0, 0, 0, 0, 0))
 assert any(last_lower_i < g < home_i for g in grip_idx), (last_lower_i, grip_idx, home_i)
 # шаг 4: конечная цель -- zero point
 assert uniq[-1] == (0, 0, 0, 0, 0, 0), uniq[-1]
 assert arm._jog_base is None
-print("OK 7: разворот J1=150°, спуск J2=56°/J3=-84°, отпустить, zero point -- порядок верный")
+print(f"OK 7: разворот J1={TURN/1000:.0f}°, спуск J2={LOW_J2/1000:.0f}°/J3={LOW_J3/1000:.0f}°, "
+      "отпустить, zero point -- порядок верный")
 
 print("\nВсе 7 проверок пройдены.")

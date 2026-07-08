@@ -32,6 +32,17 @@ calibrate_approach.py
      опираться на старый (сдвинутый) ноль -- проверь позу APPROACH и при
      необходимости перекалибруй её заново (обычный режим этого скрипта).
 
+ЕСЛИ --set-zero НЕ ПОМОГАЕТ (рука "не запоминает" ноль, суставы едут в
+неправильную сторону, фидбек ~0 при ненулевой физической позе) -- это
+известный баг инициализации joint states прошивкой после power-cycle:
+https://github.com/agilexrobotics/piper_sdk/issues/35
+Симптомы там ровно эти: рука едет в "неправильный случайный ноль",
+установка нулей через SDK не помогает, привязка углов ломается (движение
+одного сустава меняет показания других). Лечение -- режим --fix-mapping
+этого скрипта: Master-режим -> обратно Slave -> reset -> power-cycle.
+Если повторяется после каждого power-cycle -- нужна прошивка: напиши в
+support@agilex.ai, приложив версию прошивки (видно в ArmRobotUA).
+
 ПОРЯДОК ДЕЙСТВИЙ (делай именно в этом порядке):
 
   1. Подъезжаешь на роботе примерно туда, откуда обычно будешь подъезжать
@@ -120,6 +131,53 @@ def run_set_zero(piper) -> None:
     print("И НЕ ЗАБУДЬ перепроверить/перекалибровать APPROACH -- он мог опираться на старый ноль.")
 
 
+def run_fix_mapping(piper) -> None:
+    """
+    Восстановление привязки углов суставов -- workaround известного бага
+    прошивки (https://github.com/agilexrobotics/piper_sdk/issues/35):
+    после power-cycle рука может неправильно инициализировать joint states.
+    Симптомы: фидбек ~0 при ненулевой физической позе, движение "к нулю"
+    идёт в неправильную сторону, --set-zero не запоминается, движение
+    одного сустава меняет показания других. Workaround из issue #35:
+    переключить руку в Master-режим, обратно в Slave, сделать reset,
+    затем power-cycle.
+    """
+    print("\n=== ВОССТАНОВЛЕНИЕ ПРИВЯЗКИ УГЛОВ (workaround piper_sdk issue #35) ===")
+    print("ВНИМАНИЕ: при переключении в Master-режим моторы могут стать податливыми --")
+    print("ПРИДЕРЖИВАЙ руку рукой, чтобы она не упала под собственным весом.")
+    answer = input("Готов? Набери FIX и Enter (что-либо другое -- отмена): ").strip()
+    if answer != "FIX":
+        print("Отменено, ничего не отправлено.")
+        return
+
+    print(f"\nУглы ДО:    {_fmt(_read_angles(piper))}")
+
+    print("1/3: переключаю в Master (teaching input)...")
+    piper.MasterSlaveConfig(0xFA, 0, 0, 0)
+    time.sleep(2.0)
+
+    print("2/3: возвращаю в Slave (motion output)...")
+    piper.MasterSlaveConfig(0xFC, 0, 0, 0)
+    time.sleep(2.0)
+
+    print("3/3: reset...")
+    try:
+        piper.MotionCtrl_1(0x02, 0, 0)   # 0x02 = resume/reset
+    except Exception as e:
+        print(f"  MotionCtrl_1 reset не отправился ({e}) -- не критично, "
+              "главное было master/slave-переключение")
+    time.sleep(1.0)
+
+    print(f"Углы ПОСЛЕ: {_fmt(_read_angles(piper))}")
+    print("\nДальше обязательно:")
+    print("  1. Power-cycle руки (сними и подай 24В).")
+    print("  2. Проверь без флагов (python3 calibrate_approach.py): в физическом нуле")
+    print("     все суставы ~0.00, и при движении сустава РУКАМИ (drag-teach) меняется")
+    print("     именно соответствующий J на экране.")
+    print("  3. Если привязка снова ломается после power-cycle -- это прошивка:")
+    print("     напиши в support@agilex.ai, приложи версию прошивки (ArmRobotUA).")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--piper-can", default="can_piper", help="имя поднятого CAN-интерфейса руки")
@@ -127,6 +185,9 @@ def main() -> None:
     ap.add_argument("--set-zero", action="store_true",
                     help="переустановить нулевую точку: текущая поза руки станет нулём "
                          "всех суставов (см. порядок действий в docstring)")
+    ap.add_argument("--fix-mapping", action="store_true",
+                    help="восстановить привязку углов суставов (Master->Slave->reset, "
+                         "workaround piper_sdk issue #35; см. docstring)")
     args = ap.parse_args()
 
     try:
@@ -142,6 +203,10 @@ def main() -> None:
         dh_is_offset=1,
     )
     piper.ConnectPort()  # подписка на чтение CAN; EnableArm()/команды движения НЕ шлём
+
+    if args.fix_mapping:
+        run_fix_mapping(piper)
+        return
 
     if args.set_zero:
         run_set_zero(piper)
