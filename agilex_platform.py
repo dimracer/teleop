@@ -219,6 +219,12 @@ class PiperArmController:
     # (а не просто доверяем закэшированному self._move_mode) -- см. apply_jog()
     JOG_MODE_RECHECK_S = 0.5
 
+    # проверка при enable(): если фидбек показывает, что рука дальше этого от
+    # нулевой позы -- громкое предупреждение (по манулу enable разрешён только
+    # из zero point; а если рука ФИЗИЧЕСКИ в нуле, но фидбек не нулевой --
+    # значит уехал ноль самой руки, см. calibrate_approach.py --set-zero)
+    ZERO_SANITY_TOL_DEG = 10.0
+
     def __init__(self, can_name: str = "can_piper", dry_run: bool = True):
         self.can_name = can_name
         self.dry_run = dry_run
@@ -328,7 +334,44 @@ class PiperArmController:
         self._enabled = True
         self._move_mode = None  # сбрасываем, чтобы ModeCtrl ниже точно переотправился и был подтверждён
         self.enable_joint_mode()
+        self._warn_if_not_at_zero()
         logger.info("[PiPER] enabled (подтверждено по GetArmEnableStatus)")
+
+    def _warn_if_not_at_zero(self) -> None:
+        """
+        Диагностика после enable(): сверяет фидбек углов с нулевой позой.
+
+        Два разных случая, которые это ловит:
+          1. Рука физически НЕ в нулевой точке (нарушен порядок из манула,
+             раздел 2.2) -- move_home() при старте поедет издалека.
+          2. Рука физически В нулевой точке, но фидбек НЕ нулевой -- значит,
+             сместился ноль самой руки (проскок ремня/редуктора после удара
+             или случайная переустановка нуля). Тогда move_home() при старте
+             утащит руку в неправильный "ноль" (симптом: J3 уходит сильно
+             вниз, лог чистый). Лечение: calibrate_approach.py --set-zero,
+             см. README, "Диагностика #5".
+        """
+        try:
+            cur = self.get_joint_angles_deg()
+        except Exception:
+            logger.exception("[PiPER] не удалось прочитать углы для проверки нуля (продолжаю)")
+            return
+        if cur is None:  # dry_run
+            return
+        offenders = {name: getattr(cur, name)
+                     for name in ("j1", "j2", "j3", "j4", "j5", "j6")
+                     if abs(getattr(cur, name)) > self.ZERO_SANITY_TOL_DEG}
+        if offenders:
+            logger.warning(
+                "[PiPER] ВНИМАНИЕ: по фидбеку рука НЕ в нулевой точке (%s, допуск ±%.0f°). "
+                "Если рука сейчас ФИЗИЧЕСКИ стоит в нулевой позе -- значит, сместился ноль "
+                "руки, и move_home() уведёт её в неправильный 'ноль'. Останови скрипт и "
+                "переустанови ноль: python3 calibrate_approach.py --set-zero (см. README, "
+                "'Диагностика #5'). Если рука просто не была выставлена в ноль перед "
+                "запуском -- верни её в zero point (манул, раздел 2.2).",
+                ", ".join(f"{k}={v:+.1f}°" for k, v in offenders.items()),
+                self.ZERO_SANITY_TOL_DEG,
+            )
 
     def disable(self) -> None:
         if self.dry_run:

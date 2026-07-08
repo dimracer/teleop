@@ -9,6 +9,29 @@ calibrate_approach.py
 руку в режиме drag-teach. Когда рука встанет в нужную позу над предметом —
 жмёшь Ctrl+C, скрипт печатает готовую строку для вставки в pult_pickup_teleop.py.
 
+ДОПОЛНИТЕЛЬНО: режим --set-zero -- переустановка нулевой точки руки.
+Нужен, если ноль руки "уехал" (симптом: при запуске pult_pickup_teleop.py
+рука едет в неправильный "ноль", например J3 уходит сильно вниз, лог при
+этом чистый -- фидбек честно считает эту позу нулём). Ноль может сместиться
+после удара/перегрузки (проскочил ремень/редуктор) или из-за случайной
+переустановки нуля кнопкой на руке. Порядок:
+
+  1. Останови pult_pickup_teleop.py, руку оставь под питанием.
+  2. Включи drag-teach (один клик по кнопке между J5/J6, ровный зелёный).
+  3. Руками выставь руку ТОЧНО в нулевую позу (zero point, схема в PiPER
+     Quick Start Manual, раздел 2.2) и держи её.
+  4. Запусти:  python3 calibrate_approach.py --piper-can can_piper --set-zero
+     Скрипт покажет, что рука СЕЙЧАС считает своими углами (там и будет
+     виден увод, например J3 = -30° вместо 0), затем спросит подтверждение.
+  5. Набери ZERO и Enter -- текущая поза будет записана как ноль всех суставов
+     (JointConfig(7, 0xAE)).
+  6. Останови drag-teach (клик по кнопке, индикатор погас), сними/подай
+     питание руки (power-cycle) и проверь: python3 calibrate_approach.py --
+     в нулевой позе все суставы должны показывать ~0.00.
+  7. ВАЖНО: после переустановки нуля прежняя калибровка APPROACH могла
+     опираться на старый (сдвинутый) ноль -- проверь позу APPROACH и при
+     необходимости перекалибруй её заново (обычный режим этого скрипта).
+
 ПОРЯДОК ДЕЙСТВИЙ (делай именно в этом порядке):
 
   1. Подъезжаешь на роботе примерно туда, откуда обычно будешь подъезжать
@@ -53,10 +76,57 @@ import time
 import argparse
 
 
+def _read_angles(piper) -> list[float]:
+    msg = piper.GetArmJointMsgs()
+    j = msg.joint_state
+    return [
+        j.joint_1 / 1000.0, j.joint_2 / 1000.0, j.joint_3 / 1000.0,
+        j.joint_4 / 1000.0, j.joint_5 / 1000.0, j.joint_6 / 1000.0,
+    ]
+
+
+def _fmt(angles: list[float]) -> str:
+    return "  ".join(f"J{i+1}={a:7.2f}°" for i, a in enumerate(angles))
+
+
+def run_set_zero(piper) -> None:
+    """
+    Переустановка нулевой точки: текущая ФИЗИЧЕСКАЯ поза руки будет записана
+    как ноль всех суставов (JointConfig(7, 0xAE)). Использовать, когда ноль
+    руки "уехал" (после удара/проскока ремня) -- см. docstring файла, шаги 1-7.
+    """
+    print("\n=== ПЕРЕУСТАНОВКА НУЛЕВОЙ ТОЧКИ ===")
+    print("Рука должна быть в drag-teach и ФИЗИЧЕСКИ выставлена в нулевую позу")
+    print("(zero point, схема -- PiPER Quick Start Manual, раздел 2.2).\n")
+    print("Сейчас рука считает своими углами (если ноль уехал -- тут будет виден увод):")
+    for _ in range(3):
+        print(f"\r  {_fmt(_read_angles(piper))}", end="", flush=True)
+        time.sleep(0.5)
+    print("\n\nВНИМАНИЕ: текущая поза станет НУЛЁМ для всех 6 суставов.")
+    print("Отменить это можно только повторной переустановкой нуля.")
+    answer = input("Набери ZERO и Enter для подтверждения (что-либо другое -- отмена): ").strip()
+    if answer != "ZERO":
+        print("Отменено, ничего не отправлено.")
+        return
+
+    # 7 = все суставы, 0xAE = установить текущую позицию как ноль
+    # (позиционные аргументы -- имена kwargs отличаются между версиями piper_sdk)
+    piper.JointConfig(7, 0xAE)
+    time.sleep(0.5)
+    print("\nКоманда отправлена. Проверка -- рука теперь считает:")
+    print(f"  {_fmt(_read_angles(piper))}")
+    print("\nДальше: останови drag-teach (клик по кнопке J5/J6), сделай power-cycle руки,")
+    print("затем проверь нули этим же скриптом без --set-zero (в нулевой позе ~0.00).")
+    print("И НЕ ЗАБУДЬ перепроверить/перекалибровать APPROACH -- он мог опираться на старый ноль.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--piper-can", default="can_piper", help="имя поднятого CAN-интерфейса руки")
     ap.add_argument("--rate-hz", type=float, default=10.0, help="частота обновления показаний")
+    ap.add_argument("--set-zero", action="store_true",
+                    help="переустановить нулевую точку: текущая поза руки станет нулём "
+                         "всех суставов (см. порядок действий в docstring)")
     args = ap.parse_args()
 
     try:
@@ -71,7 +141,11 @@ def main() -> None:
         can_auto_init=True,
         dh_is_offset=1,
     )
-    piper.ConnectPort()  # только подписка на чтение CAN, EnableArm() НЕ вызываем
+    piper.ConnectPort()  # подписка на чтение CAN; EnableArm()/команды движения НЕ шлём
+
+    if args.set_zero:
+        run_set_zero(piper)
+        return
 
     print(f"Подключено к {args.piper_can} (только чтение, команд движения не шлём).")
     print("Переведи руку в drag-teach (кнопка между J5/J6, один клик, загорится зелёный)")
@@ -83,14 +157,8 @@ def main() -> None:
 
     try:
         while True:
-            msg = piper.GetArmJointMsgs()
-            j = msg.joint_state
-            last_angles = [
-                j.joint_1 / 1000.0, j.joint_2 / 1000.0, j.joint_3 / 1000.0,
-                j.joint_4 / 1000.0, j.joint_5 / 1000.0, j.joint_6 / 1000.0,
-            ]
-            line = "  ".join(f"J{i+1}={a:7.2f}°" for i, a in enumerate(last_angles))
-            print(f"\r{line}", end="", flush=True)
+            last_angles = _read_angles(piper)
+            print(f"\r{_fmt(last_angles)}", end="", flush=True)
             time.sleep(period)
 
     except KeyboardInterrupt:
