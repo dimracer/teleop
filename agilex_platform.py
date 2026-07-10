@@ -174,15 +174,15 @@ class PiperArmController:
 
     JOINT_LIMITS_DEG = {
         1: (-150.0, 150.0),
-        2: (0.0, 180.0),
-        3: (-170.0, 0.0),
+        2: (0.0, 170.0),
+        3: (-160.0, 0.0),
         4: (-100.0, 100.0),
         5: (-70.0, 70.0),
         6: (-120.0, 120.0),
     }
 
     # безопасная "коробка" ручного джога вокруг базовой позы (approach), мм
-    JOG_XY_LIMIT_MM = 40.0
+    JOG_XY_LIMIT_MM = 45.0
     JOG_Z_LIMIT_MM = 50.0
 
     # сколько раз повторять EnableArm()/ModeCtrl(), если фидбек не подтвердил
@@ -204,26 +204,26 @@ class PiperArmController:
 
     # штатные скорости режимов (проценты) -- используются и в подтверждаемом
     # переключении режима, и в паре ModeCtrl+команда
-    JOINT_SPEED_PCT = 30
-    ENDPOSE_SPEED_PCT = 20
+    JOINT_SPEED_PCT = 25
+    ENDPOSE_SPEED_PCT = 15
 
     # разворот-сброс (turn_lower_release_home): куда крутить J1 и насколько
     # опускать руку через J2/J3 перед отпусканием. ЗАГЛУШКИ ПОД КАЛИБРОВКУ:
     # J1=150° -- максимум в пределах программного лимита (физический предел
     # PiPER ±154°, ровно 180° невозможно); знак поменяй, если сбрасывать надо
     # в другую сторону. DROP_LOWER_PCT=0.40 -- согласованные 40% (диапазон 30-50%).
-    TURN_J1_TARGET_DEG = -150.0
-    DROP_LOWER_PCT = 0.30
+    TURN_J1_TARGET_DEG = 107.0
+    DROP_LOWER_PCT = 0.4
 
     # как часто во время джога перепроверяем реальный режим руки по фидбеку
     # (а не просто доверяем закэшированному self._move_mode) -- см. apply_jog()
-    JOG_MODE_RECHECK_S = 0.5
+    JOG_MODE_RECHECK_S = 0.8
 
     # проверка при enable(): если фидбек показывает, что рука дальше этого от
     # нулевой позы -- громкое предупреждение (по манулу enable разрешён только
     # из zero point; а если рука ФИЗИЧЕСКИ в нуле, но фидбек не нулевой --
     # значит уехал ноль самой руки, см. calibrate_approach.py --set-zero)
-    ZERO_SANITY_TOL_DEG = 10.0
+    ZERO_SANITY_TOL_DEG = 25.0
 
     def __init__(self, can_name: str = "can_piper", dry_run: bool = True):
         self.can_name = can_name
@@ -567,7 +567,7 @@ class PiperArmController:
         return False
 
     def move_home(self) -> bool:
-        return self.move_joints(JointAngles(0, 0, 0, 0, 0, 0), wait_settle=True)
+        return self.move_joints(JointAngles(0, 10, 0, 0, 0, 0), wait_settle=True)
 
     # -- декартовы движения (MOVE L) для ручной донастройки -----------------
 
@@ -718,7 +718,7 @@ class PiperArmController:
                                   fallback_joints: Optional[JointAngles] = None,
                                   turn_j1_deg: Optional[float] = None,
                                   lower_pct: Optional[float] = None,
-                                  gripper_open_mm: float = 60.0) -> bool:
+                                  gripper_open_mm: float = 69.0) -> bool:
         """
         Разворот-сброс (состояние TURNING в pult_pickup_teleop.py), выполняется
         по второму нажатию SWA из HOLDING:
@@ -755,10 +755,10 @@ class PiperArmController:
 
         # 2) спуск через J2/J3: углы по модулю больше -> рука ниже
         lowered = JointAngles(j1=turn_j1,
-                               j2=turned.j2 * (1.0 + pct),
+                               j2=46,
                                j3=turned.j3 * (1.0 - pct),
-                               j4=turned.j4 * (1.0 + pct), 
-                               j5=turned.j5, j6=turned.j6)
+                               j4=turned.j4, 
+                               j5=50, j6=turned.j6)
         ok &= self.move_joints(lowered, wait_settle=True)
 
         # 3) отпустить
@@ -777,8 +777,8 @@ class PiperArmController:
         return ok
 
     def grasp_and_lift(self, lift_mm: float = 80.0,
-                        gripper_close_mm: float = 15.0, gripper_effort_nm: float = 2.0,
-                        gripper_open_mm: float = 60.0, step_delay_s: float = 1.2) -> None:
+                        gripper_close_mm: float = 40.0, gripper_effort_nm: float = 2.0,
+                        gripper_open_mm: float = 69.0, step_delay_s: float = 1.2) -> None:
         """
         Закрывает захват ПРЯМО ИЗ ТЕКУЩЕЙ (уже подогнанной джойстиком) позы --
         без дополнительного автоматического спуска -- и поднимает на lift_mm.
@@ -888,7 +888,7 @@ class PiperArmController:
         time.sleep(step_delay_s)
         logger.info("[PiPER] === pickup_sequence: готово, объект захвачен ===")
 
-    def release_and_home(self, gripper_open_mm: float = 60.0) -> None:
+    def release_and_home(self, gripper_open_mm: float = 69.0) -> None:
         """Отпустить предмет и вернуть руку в home."""
         if not self._enabled:
             raise RuntimeError("PiPER не включён: вызови enable() перед движением")
@@ -899,7 +899,7 @@ class PiperArmController:
         self.move_home()
 
     GRIPPER_MAX_MM = 70.0
-    GRIPPER_MAX_EFFORT_NM = 5.0
+    GRIPPER_MAX_EFFORT_NM = 3.0
 
     def gripper(self, opening_mm: float, effort_nm: float = 1.0, enable: bool = True) -> None:
         opening_mm = max(0.0, min(self.GRIPPER_MAX_MM, opening_mm))
@@ -981,8 +981,8 @@ if __name__ == "__main__":
     platform = AgileXPlatform(dry_run=True)
 
     platform.startup()
-    platform.arm.move_joints(JointAngles(j1=10, j2=20, j3=-30, j4=0, j5=15, j6=0))
-    platform.arm.gripper(opening_mm=40)
+    platform.arm.move_joints(JointAngles(j1=10, j2=30, j3=-30, j4=0, j5=15, j6=0))
+    platform.arm.gripper(opening_mm=69)
     platform.arm.move_home()
     platform.drive(linear_mps=0.2, angular_rps=0.0, duration_s=1.0)
     platform.shutdown()
